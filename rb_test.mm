@@ -6,7 +6,7 @@
  *   ./rb_test dump [depth]                — dump full AX tree
  *   ./rb_test import /path/to/track.mp3   — File > Import > Import Track, inject path
  *   ./rb_test importdir /path/to/folder   — File > Import > Import Folder, inject path
- *   ./rb_test export [deviceName]         — Track > Export Track > device (lists devices if no name given)
+ *   ./rb_test export [device] ["query"]   — Track > Export Track > device (search+select if query given)
  *   ./rb_test dumpwin                     — dump AX tree of frontmost window (use after dialog opens)
  */
 
@@ -192,6 +192,271 @@ bool navigateMenu(AXUIElementRef appRef, NSString* menuItemTitle) {
     }
 
     NSLog(@"Menu action triggered! Waiting for file dialog...");
+    return true;
+}
+
+// ─── Browser Search ─────────────────────────────────────────────
+
+// Perform a search in the browser area: press search button, find field, inject text.
+// Returns true if text was successfully injected.
+bool performBrowserSearch(AXUIElementRef appRef, NSString* searchText) {
+    // Step 1: Get browser group via position probe
+    CGRect winFrame = CGRectZero;
+    CFArrayRef windows = NULL;
+    if (AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute, (CFTypeRef*)&windows) == kAXErrorSuccess && windows) {
+        if (CFArrayGetCount(windows) > 0)
+            winFrame = getAXFrame((AXUIElementRef)CFArrayGetValueAtIndex(windows, 0));
+        CFRelease(windows);
+    }
+
+    float probeX = winFrame.origin.x + winFrame.size.width / 2;
+    float probeY = winFrame.origin.y + winFrame.size.height * 0.7;
+
+    AXUIElementRef browserGroup = NULL;
+    AXUIElementCopyElementAtPosition(appRef, probeX, probeY, &browserGroup);
+    if (!browserGroup) {
+        NSLog(@"ERROR: Cannot find browser group");
+        return false;
+    }
+    NSLog(@"[1/5] Found browser group at (%.0f,%.0f)", probeX, probeY);
+
+    // Step 2: Find SelectSearchFilterButton among children
+    CFArrayRef children = NULL;
+    AXUIElementRef searchBtn = NULL;
+    if (AXUIElementCopyAttributeValue(browserGroup, kAXChildrenAttribute, (CFTypeRef*)&children) == kAXErrorSuccess && children) {
+        CFIndex count = CFArrayGetCount(children);
+        for (CFIndex i = 0; i < count; i++) {
+            AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+            NSString* title = getAXAttribute(child, kAXTitleAttribute);
+            if (title && [title isEqualToString:@"SelectSearchFilterButton"]) {
+                CFRetain(child);
+                searchBtn = child;
+                NSLog(@"[2/5] Found SelectSearchFilterButton at index %ld", i);
+                break;
+            }
+        }
+        CFRelease(children);
+    }
+    CFRelease(browserGroup);
+
+    if (!searchBtn) {
+        NSLog(@"ERROR: SelectSearchFilterButton not found in browser children");
+        return false;
+    }
+
+    // Step 3: Press it
+    NSLog(@"[3/5] Pressing SelectSearchFilterButton...");
+    AXError pressErr = (AXError)AXUIElementPerformAction(searchBtn, kAXPressAction);
+    CFRelease(searchBtn);
+    if (pressErr != kAXErrorSuccess) {
+        NSLog(@"ERROR: AXPress failed (error %d)", pressErr);
+        return false;
+    }
+    usleep(500000);  // 500ms for search field to appear
+
+    // Step 4: Find the search text field
+    NSLog(@"[4/5] Looking for search text field...");
+    AXUIElementRef browserGroup2 = NULL;
+    AXUIElementCopyElementAtPosition(appRef, probeX, probeY, &browserGroup2);
+
+    AXUIElementRef searchField = NULL;
+
+    // Strategy A: Check focused element
+    CFTypeRef focusedEl = NULL;
+    if (AXUIElementCopyAttributeValue(appRef, kAXFocusedUIElementAttribute, &focusedEl) == kAXErrorSuccess && focusedEl) {
+        NSString* fRole = getAXAttribute((AXUIElementRef)focusedEl, kAXRoleAttribute);
+        NSString* fTitle = getAXAttribute((AXUIElementRef)focusedEl, kAXTitleAttribute);
+        NSString* fHelp = getAXAttribute((AXUIElementRef)focusedEl, kAXHelpAttribute);
+        NSString* fValue = getAXAttribute((AXUIElementRef)focusedEl, kAXValueAttribute);
+        CGRect fFrame = getAXFrame((AXUIElementRef)focusedEl);
+        NSLog(@"  Focused element: [%@] title=\"%@\" help=\"%@\" value=\"%@\" frame=(%.0f,%.0f %.0fx%.0f)",
+              fRole, fTitle, fHelp, fValue, fFrame.origin.x, fFrame.origin.y, fFrame.size.width, fFrame.size.height);
+
+        CFArrayRef focusedAttrs = NULL;
+        if (AXUIElementCopyAttributeNames((AXUIElementRef)focusedEl, &focusedAttrs) == kAXErrorSuccess && focusedAttrs) {
+            NSLog(@"  Focused element attributes:");
+            CFIndex attrCount = CFArrayGetCount(focusedAttrs);
+            for (CFIndex a = 0; a < attrCount; a++) {
+                CFStringRef an = (CFStringRef)CFArrayGetValueAtIndex(focusedAttrs, a);
+                NSLog(@"    %@", (__bridge NSString*)an);
+            }
+            CFRelease(focusedAttrs);
+        }
+
+        CFArrayRef focusedActions = NULL;
+        if (AXUIElementCopyActionNames((AXUIElementRef)focusedEl, &focusedActions) == kAXErrorSuccess && focusedActions) {
+            NSLog(@"  Focused element actions: %@", (__bridge NSArray*)focusedActions);
+            CFRelease(focusedActions);
+        }
+
+        if ([fRole isEqualToString:@"AXTextField"] || [fRole isEqualToString:@"AXSearchField"] ||
+            [fRole isEqualToString:@"AXTextArea"] || [fRole isEqualToString:@"AXComboBox"] ||
+            [fRole isEqualToString:@"AXGroup"]) {
+            bool isTextEntry = NO;
+            if (![fRole isEqualToString:@"AXGroup"]) {
+                isTextEntry = YES;
+            } else {
+                CFArrayRef pAttrs = NULL;
+                if (AXUIElementCopyParameterizedAttributeNames((AXUIElementRef)focusedEl, &pAttrs) == kAXErrorSuccess && pAttrs) {
+                    CFIndex pc = CFArrayGetCount(pAttrs);
+                    for (CFIndex p = 0; p < pc; p++) {
+                        NSString* pn = (__bridge NSString*)CFArrayGetValueAtIndex(pAttrs, p);
+                        if ([pn isEqualToString:@"AXReplaceRangeWithText"]) {
+                            isTextEntry = YES;
+                            break;
+                        }
+                    }
+                    CFRelease(pAttrs);
+                }
+            }
+            if (isTextEntry) {
+                searchField = (AXUIElementRef)focusedEl;
+                CFRetain(searchField);
+                NSLog(@"  -> Using focused element as search field!");
+            }
+        }
+        CFRelease(focusedEl);
+    } else {
+        NSLog(@"  No focused element found (error).");
+    }
+
+    // Strategy B: Scan browser children for new text fields
+    if (!searchField && browserGroup2) {
+        CFArrayRef children2 = NULL;
+        if (AXUIElementCopyAttributeValue(browserGroup2, kAXChildrenAttribute, (CFTypeRef*)&children2) == kAXErrorSuccess && children2) {
+            CFIndex count = CFArrayGetCount(children2);
+            NSLog(@"  Scanning %ld browser children for text fields...", count);
+            for (CFIndex i = 0; i < count; i++) {
+                AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children2, i);
+                NSString* cRole = getAXAttribute(child, kAXRoleAttribute);
+                NSString* cTitle = getAXAttribute(child, kAXTitleAttribute);
+                NSString* cHelp = getAXAttribute(child, kAXHelpAttribute);
+
+                if ([cRole isEqualToString:@"AXTextField"] || [cRole isEqualToString:@"AXSearchField"] ||
+                    [cRole isEqualToString:@"AXTextArea"] || [cRole isEqualToString:@"AXComboBox"]) {
+                    CGRect cFrame = getAXFrame(child);
+                    NSString* cValue = getAXAttribute(child, kAXValueAttribute);
+                    NSLog(@"  Found [%@] title=\"%@\" value=\"%@\" help=\"%@\" frame=(%.0f,%.0f %.0fx%.0f)",
+                          cRole, cTitle, cValue, cHelp, cFrame.origin.x, cFrame.origin.y, cFrame.size.width, cFrame.size.height);
+
+                    if (cHelp && [cHelp containsString:@"playlist"]) {
+                        NSLog(@"    (skipping — palette field)");
+                    }
+                    else if (!searchField ||
+                        (cHelp && [cHelp rangeOfString:@"search" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+                        (cTitle && [cTitle rangeOfString:@"search" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+                        (cFrame.origin.y > 680 && cFrame.origin.y < 700)) {
+                        CFRetain(child);
+                        if (searchField) CFRelease(searchField);
+                        searchField = child;
+                    }
+                }
+
+                // Also check grandchildren
+                CFArrayRef gc = NULL;
+                if (AXUIElementCopyAttributeValue(child, kAXChildrenAttribute, (CFTypeRef*)&gc) == kAXErrorSuccess && gc) {
+                    CFIndex gcCount = CFArrayGetCount(gc);
+                    for (CFIndex j = 0; j < gcCount; j++) {
+                        AXUIElementRef grandchild = (AXUIElementRef)CFArrayGetValueAtIndex(gc, j);
+                        NSString* gcRole = getAXAttribute(grandchild, kAXRoleAttribute);
+                        if ([gcRole isEqualToString:@"AXTextField"] || [gcRole isEqualToString:@"AXSearchField"] ||
+                            [gcRole isEqualToString:@"AXTextArea"]) {
+                            NSString* gcTitle = getAXAttribute(grandchild, kAXTitleAttribute);
+                            NSString* gcHelp = getAXAttribute(grandchild, kAXHelpAttribute);
+                            CGRect gcFrame = getAXFrame(grandchild);
+                            NSLog(@"  Found (grandchild) [%@] title=\"%@\" help=\"%@\" frame=(%.0f,%.0f %.0fx%.0f)",
+                                  gcRole, gcTitle, gcHelp, gcFrame.origin.x, gcFrame.origin.y, gcFrame.size.width, gcFrame.size.height);
+                            if (!searchField) {
+                                CFRetain(grandchild);
+                                searchField = grandchild;
+                            }
+                        }
+                    }
+                    CFRelease(gc);
+                }
+            }
+            CFRelease(children2);
+        }
+    }
+    if (browserGroup2) CFRelease(browserGroup2);
+
+    // Step 5: Inject text
+    if (searchField) {
+        NSLog(@"[5/5] Injecting text into search field...");
+
+        AXError setErr = AXUIElementSetAttributeValue(searchField, kAXValueAttribute,
+                                                       (__bridge CFTypeRef)searchText);
+        if (setErr == kAXErrorSuccess) {
+            NSLog(@"  SUCCESS: Text injected via AXValue: \"%@\"", searchText);
+        } else {
+            NSLog(@"  AXValue failed (err %d). Trying focus + AXSelectedText...", setErr);
+
+            AXUIElementSetAttributeValue(searchField, kAXFocusedAttribute, kCFBooleanTrue);
+            usleep(200000);
+
+            NSLog(@"  Sending Cmd+A to select all...");
+            CGEventRef cmdA = CGEventCreateKeyboardEvent(NULL, 0 /*a*/, true);
+            CGEventSetFlags(cmdA, kCGEventFlagMaskCommand);
+            CGEventPost(kCGHIDEventTap, cmdA);
+            CFRelease(cmdA);
+            usleep(100000);
+
+            NSLog(@"  Typing \"%@\" via keystrokes...", searchText);
+            for (NSUInteger i = 0; i < [searchText length]; i++) {
+                unichar ch = [searchText characterAtIndex:i];
+                CGEventRef keyDown = CGEventCreateKeyboardEvent(NULL, 0, true);
+                CGEventRef keyUp = CGEventCreateKeyboardEvent(NULL, 0, false);
+                CGEventKeyboardSetUnicodeString(keyDown, 1, &ch);
+                CGEventKeyboardSetUnicodeString(keyUp, 1, &ch);
+                CGEventPost(kCGHIDEventTap, keyDown);
+                usleep(10000);
+                CGEventPost(kCGHIDEventTap, keyUp);
+                usleep(10000);
+                CFRelease(keyDown);
+                CFRelease(keyUp);
+            }
+            NSLog(@"  Text typed via keystrokes.");
+        }
+
+        usleep(300000);
+        NSString* resultValue = getAXAttribute(searchField, kAXValueAttribute);
+        NSLog(@"  Search field value after injection: \"%@\"", resultValue);
+
+        // Ensure the search field retains focus so Tab can move from it
+        AXUIElementSetAttributeValue(searchField, kAXFocusedAttribute, kCFBooleanTrue);
+        usleep(100000);
+
+        CFRelease(searchField);
+        return true;
+    } else {
+        NSLog(@"  No search text field found after pressing button.");
+        NSLog(@"  TIP: Run './rb_test browser' to inspect what changed.");
+        return false;
+    }
+}
+
+// ─── Browser Row Selection ──────────────────────────────────────
+
+// After a search, select the first track row in the browser results.
+// Returns true if a row was successfully selected.
+bool selectFirstBrowserRow(AXUIElementRef appRef) {
+    NSLog(@"Looking for track row to select...");
+
+    // Rekordbox track rows are custom-rendered AXGroups with no children/actions.
+    // But Tab from the search field moves focus to the first row.
+    // AXUIElementPostKeyboardEvent sends keys directly to the process (works in background).
+    NSLog(@"  Sending Tab key to Rekordbox to focus first row...");
+    AXError tabDown = AXUIElementPostKeyboardEvent(appRef, 0, 48 /*kVK_Tab*/, true);
+    usleep(50000);
+    AXError tabUp = AXUIElementPostKeyboardEvent(appRef, 0, 48, false);
+
+    if (tabDown != kAXErrorSuccess || tabUp != kAXErrorSuccess) {
+        NSLog(@"ERROR: Failed to send Tab key (down=%d up=%d)", tabDown, tabUp);
+        return false;
+    }
+
+    usleep(300000);  // 300ms for focus to move
+    NSLog(@"  Tab sent — first row should be focused/selected.");
     return true;
 }
 
@@ -619,12 +884,41 @@ int main(int argc, const char* argv[]) {
         // ── Mode: Export Track to device ──
         else if ([mode isEqualToString:@"export"]) {
             NSString* deviceName = (argc > 2) ? [NSString stringWithUTF8String:argv[2]] : nil;
-            if (deviceName) {
-                NSLog(@"=== EXPORT TRACK TO: %@ ===", deviceName);
-            } else {
+            NSString* trackQuery = (argc > 3) ? [NSString stringWithUTF8String:argv[3]] : nil;
+
+            if (!deviceName) {
                 NSLog(@"=== EXPORT TRACK: listing available devices ===");
+                navigateExportMenu(appRef, nil);
+            } else if (!trackQuery) {
+                // Export currently selected track
+                NSLog(@"=== EXPORT SELECTED TRACK TO: %@ ===", deviceName);
+                navigateExportMenu(appRef, deviceName);
+            } else {
+                // Full flow: search → select → export
+                NSLog(@"=== EXPORT TRACK \"%@\" TO: %@ ===", trackQuery, deviceName);
+
+                // Step 1: Search for the track
+                NSLog(@"--- Step 1: Search for track ---");
+                if (!performBrowserSearch(appRef, trackQuery)) {
+                    NSLog(@"ERROR: Search failed, aborting export.");
+                    CFRelease(appRef);
+                    return 1;
+                }
+                usleep(500000);  // 500ms for search results to populate
+
+                // Step 2: Select the first result row
+                NSLog(@"--- Step 2: Select track row ---");
+                if (!selectFirstBrowserRow(appRef)) {
+                    NSLog(@"ERROR: Could not select track row, aborting export.");
+                    CFRelease(appRef);
+                    return 1;
+                }
+                usleep(300000);  // 300ms for selection to settle
+
+                // Step 3: Export via menu
+                NSLog(@"--- Step 3: Export to device ---");
+                navigateExportMenu(appRef, deviceName);
             }
-            navigateExportMenu(appRef, deviceName);
         }
         // ── Mode: Menu only (just open menu, don't interact with dialog) ──
         else if ([mode isEqualToString:@"menutest"]) {
@@ -926,249 +1220,7 @@ int main(int argc, const char* argv[]) {
         else if ([mode isEqualToString:@"search"]) {
             NSString* searchText = (argc > 2) ? [NSString stringWithUTF8String:argv[2]] : @"#GRV_TEST";
             NSLog(@"=== SEARCH: \"%@\" ===", searchText);
-
-            // Step 1: Get browser group via position probe
-            CGRect winFrame = CGRectZero;
-            CFArrayRef windows = NULL;
-            if (AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute, (CFTypeRef*)&windows) == kAXErrorSuccess && windows) {
-                if (CFArrayGetCount(windows) > 0)
-                    winFrame = getAXFrame((AXUIElementRef)CFArrayGetValueAtIndex(windows, 0));
-                CFRelease(windows);
-            }
-
-            float probeX = winFrame.origin.x + winFrame.size.width / 2;
-            float probeY = winFrame.origin.y + winFrame.size.height * 0.7;
-
-            AXUIElementRef browserGroup = NULL;
-            AXUIElementCopyElementAtPosition(appRef, probeX, probeY, &browserGroup);
-            if (!browserGroup) {
-                NSLog(@"ERROR: Cannot find browser group");
-                CFRelease(appRef);
-                return 1;
-            }
-            NSLog(@"[1/5] Found browser group at (%.0f,%.0f)", probeX, probeY);
-
-            // Step 2: Find SelectSearchFilterButton among children
-            CFArrayRef children = NULL;
-            AXUIElementRef searchBtn = NULL;
-            if (AXUIElementCopyAttributeValue(browserGroup, kAXChildrenAttribute, (CFTypeRef*)&children) == kAXErrorSuccess && children) {
-                CFIndex count = CFArrayGetCount(children);
-                for (CFIndex i = 0; i < count; i++) {
-                    AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
-                    NSString* title = getAXAttribute(child, kAXTitleAttribute);
-                    if (title && [title isEqualToString:@"SelectSearchFilterButton"]) {
-                        CFRetain(child);
-                        searchBtn = child;
-                        NSLog(@"[2/5] Found SelectSearchFilterButton at index %ld", i);
-                        break;
-                    }
-                }
-                CFRelease(children);
-            }
-            CFRelease(browserGroup);
-
-            if (!searchBtn) {
-                NSLog(@"ERROR: SelectSearchFilterButton not found in browser children");
-                CFRelease(appRef);
-                return 1;
-            }
-
-            // Step 3: Press it
-            NSLog(@"[3/5] Pressing SelectSearchFilterButton...");
-            AXError pressErr = (AXError)AXUIElementPerformAction(searchBtn, kAXPressAction);
-            CFRelease(searchBtn);
-            if (pressErr != kAXErrorSuccess) {
-                NSLog(@"ERROR: AXPress failed (error %d)", pressErr);
-                CFRelease(appRef);
-                return 1;
-            }
-            usleep(500000);  // 500ms for search field to appear
-
-            // Step 4: Find the search text field
-            // Re-probe the browser group since the UI may have changed
-            NSLog(@"[4/5] Looking for search text field...");
-            AXUIElementRef browserGroup2 = NULL;
-            AXUIElementCopyElementAtPosition(appRef, probeX, probeY, &browserGroup2);
-
-            AXUIElementRef searchField = NULL;
-
-            // Strategy A: Check focused element
-            CFTypeRef focusedEl = NULL;
-            if (AXUIElementCopyAttributeValue(appRef, kAXFocusedUIElementAttribute, &focusedEl) == kAXErrorSuccess && focusedEl) {
-                NSString* fRole = getAXAttribute((AXUIElementRef)focusedEl, kAXRoleAttribute);
-                NSString* fTitle = getAXAttribute((AXUIElementRef)focusedEl, kAXTitleAttribute);
-                NSString* fHelp = getAXAttribute((AXUIElementRef)focusedEl, kAXHelpAttribute);
-                NSString* fValue = getAXAttribute((AXUIElementRef)focusedEl, kAXValueAttribute);
-                CGRect fFrame = getAXFrame((AXUIElementRef)focusedEl);
-                NSLog(@"  Focused element: [%@] title=\"%@\" help=\"%@\" value=\"%@\" frame=(%.0f,%.0f %.0fx%.0f)",
-                      fRole, fTitle, fHelp, fValue, fFrame.origin.x, fFrame.origin.y, fFrame.size.width, fFrame.size.height);
-
-                // Dump its attributes
-                CFArrayRef focusedAttrs = NULL;
-                if (AXUIElementCopyAttributeNames((AXUIElementRef)focusedEl, &focusedAttrs) == kAXErrorSuccess && focusedAttrs) {
-                    NSLog(@"  Focused element attributes:");
-                    CFIndex attrCount = CFArrayGetCount(focusedAttrs);
-                    for (CFIndex a = 0; a < attrCount; a++) {
-                        CFStringRef an = (CFStringRef)CFArrayGetValueAtIndex(focusedAttrs, a);
-                        NSLog(@"    %@", (__bridge NSString*)an);
-                    }
-                    CFRelease(focusedAttrs);
-                }
-
-                // Also dump its actions
-                CFArrayRef focusedActions = NULL;
-                if (AXUIElementCopyActionNames((AXUIElementRef)focusedEl, &focusedActions) == kAXErrorSuccess && focusedActions) {
-                    NSLog(@"  Focused element actions: %@", (__bridge NSArray*)focusedActions);
-                    CFRelease(focusedActions);
-                }
-
-                // Accept any text-entry-capable element
-                if ([fRole isEqualToString:@"AXTextField"] || [fRole isEqualToString:@"AXSearchField"] ||
-                    [fRole isEqualToString:@"AXTextArea"] || [fRole isEqualToString:@"AXComboBox"] ||
-                    [fRole isEqualToString:@"AXGroup"]) {
-                    // For AXGroup, check if it has text-entry attributes
-                    bool isTextEntry = NO;
-                    if (![fRole isEqualToString:@"AXGroup"]) {
-                        isTextEntry = YES;
-                    } else {
-                        // Check if this group has value + focused attributes (could be a custom text field)
-                        CFArrayRef pAttrs = NULL;
-                        if (AXUIElementCopyParameterizedAttributeNames((AXUIElementRef)focusedEl, &pAttrs) == kAXErrorSuccess && pAttrs) {
-                            CFIndex pc = CFArrayGetCount(pAttrs);
-                            for (CFIndex p = 0; p < pc; p++) {
-                                NSString* pn = (__bridge NSString*)CFArrayGetValueAtIndex(pAttrs, p);
-                                if ([pn isEqualToString:@"AXReplaceRangeWithText"]) {
-                                    isTextEntry = YES;
-                                    break;
-                                }
-                            }
-                            CFRelease(pAttrs);
-                        }
-                    }
-                    if (isTextEntry) {
-                        searchField = (AXUIElementRef)focusedEl;
-                        CFRetain(searchField);
-                        NSLog(@"  -> Using focused element as search field!");
-                    }
-                }
-                CFRelease(focusedEl);
-            } else {
-                NSLog(@"  No focused element found (error).");
-            }
-
-            // Strategy B: Scan browser children for new text fields
-            if (!searchField && browserGroup2) {
-                CFArrayRef children2 = NULL;
-                if (AXUIElementCopyAttributeValue(browserGroup2, kAXChildrenAttribute, (CFTypeRef*)&children2) == kAXErrorSuccess && children2) {
-                    CFIndex count = CFArrayGetCount(children2);
-                    NSLog(@"  Scanning %ld browser children for text fields...", count);
-                    for (CFIndex i = 0; i < count; i++) {
-                        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children2, i);
-                        NSString* cRole = getAXAttribute(child, kAXRoleAttribute);
-                        NSString* cTitle = getAXAttribute(child, kAXTitleAttribute);
-                        NSString* cHelp = getAXAttribute(child, kAXHelpAttribute);
-
-                        if ([cRole isEqualToString:@"AXTextField"] || [cRole isEqualToString:@"AXSearchField"] ||
-                            [cRole isEqualToString:@"AXTextArea"] || [cRole isEqualToString:@"AXComboBox"]) {
-                            CGRect cFrame = getAXFrame(child);
-                            NSString* cValue = getAXAttribute(child, kAXValueAttribute);
-                            NSLog(@"  Found [%@] title=\"%@\" value=\"%@\" help=\"%@\" frame=(%.0f,%.0f %.0fx%.0f)",
-                                  cRole, cTitle, cValue, cHelp, cFrame.origin.x, cFrame.origin.y, cFrame.size.width, cFrame.size.height);
-
-                            // Skip palette "blank list" fields
-                            if (cHelp && [cHelp containsString:@"playlist"]) {
-                                NSLog(@"    (skipping — palette field)");
-                            }
-                            // Prefer fields related to search, or near the search button area (y~689)
-                            else if (!searchField ||
-                                (cHelp && [cHelp rangeOfString:@"search" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
-                                (cTitle && [cTitle rangeOfString:@"search" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
-                                (cFrame.origin.y > 680 && cFrame.origin.y < 700)) {
-                                CFRetain(child);
-                                if (searchField) CFRelease(searchField);
-                                searchField = child;
-                            }
-                        }
-
-                        // Also check grandchildren
-                        CFArrayRef gc = NULL;
-                        if (AXUIElementCopyAttributeValue(child, kAXChildrenAttribute, (CFTypeRef*)&gc) == kAXErrorSuccess && gc) {
-                            CFIndex gcCount = CFArrayGetCount(gc);
-                            for (CFIndex j = 0; j < gcCount; j++) {
-                                AXUIElementRef grandchild = (AXUIElementRef)CFArrayGetValueAtIndex(gc, j);
-                                NSString* gcRole = getAXAttribute(grandchild, kAXRoleAttribute);
-                                if ([gcRole isEqualToString:@"AXTextField"] || [gcRole isEqualToString:@"AXSearchField"] ||
-                                    [gcRole isEqualToString:@"AXTextArea"]) {
-                                    NSString* gcTitle = getAXAttribute(grandchild, kAXTitleAttribute);
-                                    NSString* gcHelp = getAXAttribute(grandchild, kAXHelpAttribute);
-                                    CGRect gcFrame = getAXFrame(grandchild);
-                                    NSLog(@"  Found (grandchild) [%@] title=\"%@\" help=\"%@\" frame=(%.0f,%.0f %.0fx%.0f)",
-                                          gcRole, gcTitle, gcHelp, gcFrame.origin.x, gcFrame.origin.y, gcFrame.size.width, gcFrame.size.height);
-                                    if (!searchField) {
-                                        CFRetain(grandchild);
-                                        searchField = grandchild;
-                                    }
-                                }
-                            }
-                            CFRelease(gc);
-                        }
-                    }
-                    CFRelease(children2);
-                }
-            }
-            if (browserGroup2) CFRelease(browserGroup2);
-
-            // Step 5: Inject text
-            if (searchField) {
-                NSLog(@"[5/5] Injecting text into search field...");
-
-                // Try AXValue first
-                AXError setErr = AXUIElementSetAttributeValue(searchField, kAXValueAttribute,
-                                                               (__bridge CFTypeRef)searchText);
-                if (setErr == kAXErrorSuccess) {
-                    NSLog(@"  SUCCESS: Text injected via AXValue: \"%@\"", searchText);
-                } else {
-                    NSLog(@"  AXValue failed (err %d). Trying focus + AXSelectedText...", setErr);
-
-                    // Focus the field
-                    AXUIElementSetAttributeValue(searchField, kAXFocusedAttribute, kCFBooleanTrue);
-                    usleep(200000);
-
-                    // Try Cmd+A to select all, then type
-                    NSLog(@"  Sending Cmd+A to select all...");
-                    CGEventRef cmdA = CGEventCreateKeyboardEvent(NULL, 0 /*a*/, true);
-                    CGEventSetFlags(cmdA, kCGEventFlagMaskCommand);
-                    CGEventPost(kCGHIDEventTap, cmdA);
-                    CFRelease(cmdA);
-                    usleep(100000);
-
-                    // Type the search text
-                    NSLog(@"  Typing \"%@\" via keystrokes...", searchText);
-                    for (NSUInteger i = 0; i < [searchText length]; i++) {
-                        unichar ch = [searchText characterAtIndex:i];
-                        CGEventRef keyDown = CGEventCreateKeyboardEvent(NULL, 0, true);
-                        CGEventRef keyUp = CGEventCreateKeyboardEvent(NULL, 0, false);
-                        CGEventKeyboardSetUnicodeString(keyDown, 1, &ch);
-                        CGEventKeyboardSetUnicodeString(keyUp, 1, &ch);
-                        CGEventPost(kCGHIDEventTap, keyDown);
-                        usleep(10000);
-                        CGEventPost(kCGHIDEventTap, keyUp);
-                        usleep(10000);
-                        CFRelease(keyDown);
-                        CFRelease(keyUp);
-                    }
-                    NSLog(@"  Text typed via keystrokes.");
-                }
-
-                // Verify
-                usleep(300000);
-                NSString* resultValue = getAXAttribute(searchField, kAXValueAttribute);
-                NSLog(@"  Search field value after injection: \"%@\"", resultValue);
-                CFRelease(searchField);
-            } else {
-                NSLog(@"  No search text field found after pressing button.");
-                NSLog(@"  TIP: Run './rb_test browser' to inspect what changed.");
-            }
+            performBrowserSearch(appRef, searchText);
         }
         else {
             NSLog(@"Usage:");
@@ -1178,7 +1230,8 @@ int main(int argc, const char* argv[]) {
             NSLog(@"  ./rb_test import /path/to/track.mp3   — full import flow for a track");
             NSLog(@"  ./rb_test importdir /path/to/folder   — full import flow for a folder");
             NSLog(@"  ./rb_test export                      — list available export devices");
-            NSLog(@"  ./rb_test export VEGA                 — export selected track to device 'VEGA'");
+            NSLog(@"  ./rb_test export VEGA                 — export currently selected track to 'VEGA'");
+            NSLog(@"  ./rb_test export VEGA \"track name\"    — search, select, and export track to 'VEGA'");
             NSLog(@"  ./rb_test probe                       — scan browser area by screen coordinates");
             NSLog(@"  ./rb_test browser                     — inspect browser group attributes + children");
         }
