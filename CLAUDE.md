@@ -25,19 +25,24 @@ No Makefile, no package manager, no Xcode project. Single compilation unit.
 ./rb_test probe                       # Grid-based browser area scanning
 ./rb_test browser                     # Deep inspection of browser group
 ./rb_test search "query"              # Search field interaction + text injection
+./rb_test export                      # List available export devices
+./rb_test export DEVICE               # Export currently selected track to device
+./rb_test export DEVICE "query"       # Search + select + export in one flow
 ```
 
-Requires: macOS, Accessibility permission granted in System Settings, running Rekordbox instance.
+Requires: macOS, Accessibility permission granted in System Settings, running Rekordbox instance. Both the tool **and** Rekordbox need Accessibility permission.
 
 ## Architecture
 
-**Single file (`rb_test.mm`, ~1067 lines)** with these logical sections:
+**Single file (`rb_test.mm`)** with these logical sections:
 
 - **Helpers** — `findRekordboxPID()`, `getAXAttribute()`, `getAXFrame()` for AX element access
 - **Tree traversal** — `dumpAXTree()`, `findChildByTitle()`, `findElementByRole()`, `findAllTextFields()` for recursive AX tree inspection
 - **Menu navigation** — `navigateMenu()` automates File > Import > Track/Folder menu path
 - **File dialog** — `interactWithFileDialog()` polls for dialog, injects paths, triggers confirmation
-- **Search/browser** — Probing and search field interaction with multi-strategy fallbacks
+- **Browser search** — `performBrowserSearch()` focuses search field via Cmd+F, injects query text
+- **Row selection** — `selectFirstBrowserRow()` sends Tab to move focus from search to first track row
+- **Export** — `navigateExportMenu()` walks Track > Export Track > device menu path
 - **CLI dispatch** — `main()` routes to mode handlers based on argv
 
 ## Key Technical Details
@@ -45,8 +50,9 @@ Requires: macOS, Accessibility permission granted in System Settings, running Re
 - **C-based AX API** (`AXUIElementRef`, not Swift Accessibility framework)
 - **Manual memory management** — `CFRetain`/`CFRelease` on AX elements. Watch for leaks on error paths.
 - **Keystroke simulation** — `CGEventCreateKeyboardEvent` for character-by-character text injection
+- **Background-safe key events** — `CGEventPostToPSN` sends keyboard events to Rekordbox's process directly, without requiring window focus. Used for Cmd+F (search focus) and text fallback injection.
+- **`AXUIElementPostKeyboardEvent`** — Sends keys to a specific process (used for Tab-based row selection). Deprecated since macOS 10.9 but still functional.
 - **Polling-based waits** — Dialog detection uses retry loops (e.g., 10 attempts × 300ms) with `usleep()`
-- **Multi-strategy fallbacks** — Search field location tries focused element, then breadth scan, then grandchild scan
 
 ## Working With This Code
 
@@ -54,3 +60,4 @@ Requires: macOS, Accessibility permission granted in System Settings, running Re
 - **Hardcoded delays** between UI interactions (200ms–500ms). May need tuning on slower systems.
 - **File dialog confirmation is gated** — the confirm button is logged but not pressed unless explicitly triggered, as a safety measure.
 - **No tests** — verification is manual via tree dumps and observing Rekordbox behavior.
+- **All operations run in background** — no need to focus/activate Rekordbox window. Uses process-targeted events throughout.
