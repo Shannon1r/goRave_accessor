@@ -7,6 +7,8 @@
  *   ./rb_test import /path/to/track.mp3   — File > Import > Import Track, inject path
  *   ./rb_test importdir /path/to/folder   — File > Import > Import Folder, inject path
  *   ./rb_test export [device] ["query"]   — Track > Export Track > device (search+select if query given)
+ *   ./rb_test reload                      — Switch to XML view + press Reload button
+ *   ./rb_test exportxml                   — File > Export Collection in xml format
  *   ./rb_test dumpwin                     — dump AX tree of frontmost window (use after dialog opens)
  */
 
@@ -200,23 +202,244 @@ bool navigateMenu(AXUIElementRef appRef, NSString* menuItemTitle) {
     return true;
 }
 
-// ─── Browser Search ─────────────────────────────────────────────
+// ─── Export Collection to XML ────────────────────────────────────
 
-// Perform a search in the browser area: press search button, find field, inject text.
-// Returns true if text was successfully injected.
-bool performBrowserSearch(AXUIElementRef appRef, NSString* searchText) {
-    // Step 1: Focus the search field by sending Cmd+F to Rekordbox.
-    // CGEventPostToPSN targets the process directly (works in background).
-    // JUCE browser elements aren't linked in the AX children hierarchy,
-    // but become accessible via kAXFocusedUIElementAttribute once focused.
-    NSLog(@"[1/2] Focusing search field via Cmd+F...");
-
-    pid_t pid = 0;
-    AXUIElementGetPid(appRef, &pid);
-    if (!pid) {
-        NSLog(@"ERROR: Cannot get PID from app element");
+// File > Export Collection in xml format
+bool exportCollectionXML(AXUIElementRef appRef) {
+    CFTypeRef menuBar = NULL;
+    AXError err = AXUIElementCopyAttributeValue(appRef, kAXMenuBarAttribute, &menuBar);
+    if (err != kAXErrorSuccess || !menuBar) {
+        NSLog(@"ERROR: Cannot access menu bar (error %d)", err);
         return false;
     }
+
+    AXUIElementRef fileItem = findChildByTitle((AXUIElementRef)menuBar, @"AXMenuBarItem", @"File");
+    CFRelease(menuBar);
+    if (!fileItem) { NSLog(@"ERROR: 'File' menu not found"); return false; }
+
+    NSLog(@"[1/2] Opening File menu...");
+    AXUIElementPerformAction(fileItem, kAXPressAction);
+    usleep(200000);
+
+    AXUIElementRef exportItem = findChildByTitle(fileItem, @"AXMenuItem", @"Export Collection in xml format");
+    CFRelease(fileItem);
+    if (!exportItem) {
+        NSLog(@"ERROR: 'Export Collection in xml format' not found in File menu");
+        CGEventRef escape = CGEventCreateKeyboardEvent(NULL, 53, true);
+        CGEventPost(kCGHIDEventTap, escape);
+        CFRelease(escape);
+        return false;
+    }
+
+    NSLog(@"[2/2] Pressing 'Export Collection in xml format'...");
+    err = AXUIElementPerformAction(exportItem, kAXPressAction);
+    CFRelease(exportItem);
+    if (err != kAXErrorSuccess) {
+        NSLog(@"ERROR: AXPress failed (error %d)", err);
+        return false;
+    }
+
+    NSLog(@"Export Collection in xml format triggered!");
+    return true;
+}
+
+// ─── Browser Area Frame ─────────────────────────────────────────
+
+// Derive the browser area frame from AX-accessible window children.
+// The browser is the JUCE content area between the deck area (group[1]) bottom
+// and the status bar (first small group after deck) top. All coordinates are
+// absolute screen positions so the result works directly with hit-testing.
+CGRect getBrowserFrame(AXUIElementRef appRef) {
+    CFArrayRef windows = NULL;
+    if (AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute, (CFTypeRef*)&windows) != kAXErrorSuccess || !windows)
+        return CGRectZero;
+    if (CFArrayGetCount(windows) == 0) { CFRelease(windows); return CGRectZero; }
+
+    AXUIElementRef win = (AXUIElementRef)CFArrayGetValueAtIndex(windows, 0);
+    CGRect winFrame = getAXFrame(win);
+
+    CFArrayRef children = NULL;
+    if (AXUIElementCopyAttributeValue(win, kAXChildrenAttribute, (CFTypeRef*)&children) != kAXErrorSuccess || !children) {
+        CFRelease(windows);
+        return CGRectZero;
+    }
+
+    // Find the deck area (largest group with many children) and status bar groups
+    CGFloat browserTop = 0, browserBottom = 0;
+    CFIndex count = CFArrayGetCount(children);
+
+    // The deck area is the group with the most children (129+).
+    // Status bar groups are the small ones at the bottom (height ~23).
+    CGFloat deckBottom = 0;
+    CGFloat statusBarTop = winFrame.origin.y + winFrame.size.height;
+
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+        NSString* role = getAXAttribute(child, kAXRoleAttribute);
+        if (![role isEqualToString:@"AXGroup"]) continue;
+
+        CGRect f = getAXFrame(child);
+
+        // Count children to distinguish deck (many) from browser/status (0/few)
+        CFArrayRef grandchildren = NULL;
+        CFIndex gcCount = 0;
+        if (AXUIElementCopyAttributeValue(child, kAXChildrenAttribute, (CFTypeRef*)&grandchildren) == kAXErrorSuccess && grandchildren) {
+            gcCount = CFArrayGetCount(grandchildren);
+            CFRelease(grandchildren);
+        }
+
+        if (gcCount > 50) {
+            // This is the deck area
+            deckBottom = f.origin.y + f.size.height;
+        } else if (f.size.height < 40 && f.origin.y > winFrame.origin.y + winFrame.size.height * 0.5) {
+            // Small group in the lower half — status bar
+            if (f.origin.y < statusBarTop) {
+                statusBarTop = f.origin.y;
+            }
+        }
+    }
+
+    CFRelease(children);
+    CFRelease(windows);
+
+    if (deckBottom > 0 && statusBarTop > deckBottom) {
+        browserTop = deckBottom;
+        browserBottom = statusBarTop;
+    } else {
+        // Fallback: use proportional estimate within window
+        browserTop = winFrame.origin.y + winFrame.size.height * 0.6;
+        browserBottom = winFrame.origin.y + winFrame.size.height - 30;
+    }
+
+    return CGRectMake(winFrame.origin.x, browserTop, winFrame.size.width, browserBottom - browserTop);
+}
+
+// ─── JUCE Browser Group Access ──────────────────────────────────
+
+// Get the JUCE browser group via hit-testing in the browser area.
+// The JUCE group (title="rekordbox") contains all browser elements as direct
+// AXChildren — unlike the native content group which reports 0 children.
+AXUIElementRef getJUCEBrowserGroup(AXUIElementRef appRef) {
+    CGRect browserFrame = getBrowserFrame(appRef);
+    if (CGRectIsEmpty(browserFrame)) return NULL;
+
+    // Hit-test at the center of the browser area to get the JUCE group
+    float probeX = browserFrame.origin.x + browserFrame.size.width * 0.5;
+    float probeY = browserFrame.origin.y + browserFrame.size.height * 0.5;
+
+    AXUIElementRef hit = NULL;
+    if (AXUIElementCopyElementAtPosition(appRef, probeX, probeY, &hit) == kAXErrorSuccess && hit) {
+        NSString* role = getAXAttribute(hit, kAXRoleAttribute);
+        NSString* title = getAXAttribute(hit, kAXTitleAttribute);
+        if ([role isEqualToString:@"AXGroup"] && [title isEqualToString:@"rekordbox"]) {
+            return hit;  // caller must CFRelease
+        }
+        CFRelease(hit);
+    }
+    return NULL;
+}
+
+// Find a button inside the JUCE browser group by matching its Help attribute.
+// Returns retained element or NULL.
+AXUIElementRef findBrowserButton(AXUIElementRef juceGroup, NSString* helpPrefix) {
+    CFArrayRef children = NULL;
+    if (AXUIElementCopyAttributeValue(juceGroup, kAXChildrenAttribute, (CFTypeRef*)&children) != kAXErrorSuccess || !children)
+        return NULL;
+
+    CFIndex count = CFArrayGetCount(children);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+        NSString* role = getAXAttribute(child, kAXRoleAttribute);
+        if (![role isEqualToString:@"AXButton"]) continue;
+
+        NSString* help = getAXAttribute(child, kAXHelpAttribute);
+        if (help && [help hasPrefix:helpPrefix]) {
+            CFRetain(child);
+            CFRelease(children);
+            return child;
+        }
+    }
+    CFRelease(children);
+    return NULL;
+}
+
+// ─── Reload XML Library ─────────────────────────────────────────
+
+// Press a browser sidebar button by help-text prefix. Logs the result.
+bool pressBrowserButton(AXUIElementRef appRef, NSString* helpPrefix, NSString* label) {
+    AXUIElementRef juceGroup = getJUCEBrowserGroup(appRef);
+    if (!juceGroup) {
+        NSLog(@"ERROR: Could not find JUCE browser group");
+        return false;
+    }
+
+    AXUIElementRef btn = findBrowserButton(juceGroup, helpPrefix);
+    if (!btn) {
+        NSLog(@"ERROR: '%@' button not found in browser children", label);
+        CFRelease(juceGroup);
+        return false;
+    }
+
+    CGRect f = getAXFrame(btn);
+    NSLog(@"Found '%@' button at (%.0f,%.0f %.0fx%.0f)", label,
+          f.origin.x, f.origin.y, f.size.width, f.size.height);
+
+    AXError err = AXUIElementPerformAction(btn, kAXPressAction);
+    CFRelease(btn);
+    CFRelease(juceGroup);
+
+    if (err == kAXErrorSuccess) {
+        NSLog(@"'%@' button pressed successfully!", label);
+        return true;
+    } else {
+        NSLog(@"ERROR: AXPress on '%@' failed (error %d)", label, err);
+        return false;
+    }
+}
+
+// Switch to XML view and reload the XML library.
+bool reloadXMLLibrary(AXUIElementRef appRef) {
+    // Step 1: Switch to XML view
+    NSLog(@"[1/2] Switching to rekordbox xml view...");
+    if (!pressBrowserButton(appRef, @"Display rekordbox xml", @"Display rekordbox xml")) {
+        return false;
+    }
+    usleep(500000);  // 500ms for view to switch
+
+    // Step 2: Press Reload
+    NSLog(@"[2/2] Pressing Reload...");
+    return pressBrowserButton(appRef, @"Reload", @"Reload XML library");
+}
+
+// ─── Browser Search ─────────────────────────────────────────────
+
+// Find the search text field (AXTextArea) in the JUCE browser group's children.
+// Returns retained element or NULL.
+AXUIElementRef findSearchField(AXUIElementRef juceGroup) {
+    CFArrayRef children = NULL;
+    if (AXUIElementCopyAttributeValue(juceGroup, kAXChildrenAttribute, (CFTypeRef*)&children) != kAXErrorSuccess || !children)
+        return NULL;
+
+    CFIndex count = CFArrayGetCount(children);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+        NSString* role = getAXAttribute(child, kAXRoleAttribute);
+        if ([role isEqualToString:@"AXTextArea"]) {
+            CFRetain(child);
+            CFRelease(children);
+            return child;
+        }
+    }
+    CFRelease(children);
+    return NULL;
+}
+
+// Focus the search field via Cmd+F (fallback when tree walking fails).
+// Returns retained AXTextArea element or NULL.
+AXUIElementRef focusSearchFieldViaCmdF(AXUIElementRef appRef) {
+    pid_t pid = 0;
+    AXUIElementGetPid(appRef, &pid);
+    if (!pid) return NULL;
 
     ProcessSerialNumber psn;
     GetProcessForPID(pid, &psn);
@@ -232,73 +455,103 @@ bool performBrowserSearch(AXUIElementRef appRef, NSString* searchText) {
     CFRelease(cmdFUp);
     usleep(500000);
 
-    // Get the focused element — should be the AXTextArea search field
-    AXUIElementRef searchField = NULL;
     CFTypeRef focused = NULL;
     if (AXUIElementCopyAttributeValue(appRef, kAXFocusedUIElementAttribute, &focused) == kAXErrorSuccess && focused) {
         NSString* role = getAXAttribute((AXUIElementRef)focused, kAXRoleAttribute);
         if ([role isEqualToString:@"AXTextArea"]) {
-            searchField = (AXUIElementRef)focused;
-            CFRetain(searchField);
+            AXUIElementRef result = (AXUIElementRef)focused;
+            CFRetain(result);
+            CFRelease(focused);
+            return result;
         }
         CFRelease(focused);
     }
+    return NULL;
+}
 
-    if (!searchField) {
-        NSLog(@"ERROR: Cmd+F did not focus the search text field");
-        return false;
-    }
-    NSLog(@"  Search field focused: [AXTextArea]");
+// Inject text into a search field, using AXValue or keystroke fallback.
+bool injectSearchText(AXUIElementRef appRef, AXUIElementRef searchField, NSString* searchText) {
+    NSLog(@"[2/2] Injecting text into search field...");
 
-    // Step 2: Inject text
-    {
-        NSLog(@"[2/2] Injecting text into search field...");
+    // Focus the field first
+    AXUIElementSetAttributeValue(searchField, kAXFocusedAttribute, kCFBooleanTrue);
+    usleep(200000);
 
-        AXError setErr = AXUIElementSetAttributeValue(searchField, kAXValueAttribute,
-                                                       (__bridge CFTypeRef)searchText);
-        if (setErr == kAXErrorSuccess) {
-            NSLog(@"  SUCCESS: Text injected via AXValue: \"%@\"", searchText);
-        } else {
-            NSLog(@"  AXValue failed (err %d). Trying focus + AXSelectedText...", setErr);
+    AXError setErr = AXUIElementSetAttributeValue(searchField, kAXValueAttribute,
+                                                   (__bridge CFTypeRef)searchText);
+    if (setErr == kAXErrorSuccess) {
+        NSLog(@"  SUCCESS: Text injected via AXValue: \"%@\"", searchText);
+    } else {
+        NSLog(@"  AXValue failed (err %d). Typing via keystrokes...", setErr);
 
-            AXUIElementSetAttributeValue(searchField, kAXFocusedAttribute, kCFBooleanTrue);
-            usleep(200000);
+        pid_t pid = 0;
+        AXUIElementGetPid(appRef, &pid);
+        ProcessSerialNumber psn;
+        GetProcessForPID(pid, &psn);
 
-            NSLog(@"  Sending Cmd+A to select all...");
-            CGEventRef cmdA = CGEventCreateKeyboardEvent(NULL, 0 /*a*/, true);
-            CGEventSetFlags(cmdA, kCGEventFlagMaskCommand);
-            CGEventPostToPSN(&psn, cmdA);
-            CFRelease(cmdA);
-            usleep(100000);
-
-            NSLog(@"  Typing \"%@\" via keystrokes...", searchText);
-            for (NSUInteger i = 0; i < [searchText length]; i++) {
-                unichar ch = [searchText characterAtIndex:i];
-                CGEventRef keyDown = CGEventCreateKeyboardEvent(NULL, 0, true);
-                CGEventRef keyUp = CGEventCreateKeyboardEvent(NULL, 0, false);
-                CGEventKeyboardSetUnicodeString(keyDown, 1, &ch);
-                CGEventKeyboardSetUnicodeString(keyUp, 1, &ch);
-                CGEventPostToPSN(&psn, keyDown);
-                usleep(10000);
-                CGEventPostToPSN(&psn, keyUp);
-                usleep(10000);
-                CFRelease(keyDown);
-                CFRelease(keyUp);
-            }
-            NSLog(@"  Text typed via keystrokes.");
-        }
-
-        usleep(300000);
-        NSString* resultValue = getAXAttribute(searchField, kAXValueAttribute);
-        NSLog(@"  Search field value after injection: \"%@\"", resultValue);
-
-        // Ensure the search field retains focus so Tab can move from it
-        AXUIElementSetAttributeValue(searchField, kAXFocusedAttribute, kCFBooleanTrue);
+        // Select all existing text, then type replacement
+        CGEventRef cmdA = CGEventCreateKeyboardEvent(NULL, 0 /*a*/, true);
+        CGEventSetFlags(cmdA, kCGEventFlagMaskCommand);
+        CGEventPostToPSN(&psn, cmdA);
+        CFRelease(cmdA);
         usleep(100000);
 
-        CFRelease(searchField);
-        return true;
+        for (NSUInteger i = 0; i < [searchText length]; i++) {
+            unichar ch = [searchText characterAtIndex:i];
+            CGEventRef keyDown = CGEventCreateKeyboardEvent(NULL, 0, true);
+            CGEventRef keyUp = CGEventCreateKeyboardEvent(NULL, 0, false);
+            CGEventKeyboardSetUnicodeString(keyDown, 1, &ch);
+            CGEventKeyboardSetUnicodeString(keyUp, 1, &ch);
+            CGEventPostToPSN(&psn, keyDown);
+            usleep(10000);
+            CGEventPostToPSN(&psn, keyUp);
+            usleep(10000);
+            CFRelease(keyDown);
+            CFRelease(keyUp);
+        }
+        NSLog(@"  Text typed via keystrokes.");
     }
+
+    usleep(300000);
+    NSString* resultValue = getAXAttribute(searchField, kAXValueAttribute);
+    NSLog(@"  Search field value after injection: \"%@\"", resultValue);
+
+    // Ensure the search field retains focus so Tab can move from it
+    AXUIElementSetAttributeValue(searchField, kAXFocusedAttribute, kCFBooleanTrue);
+    usleep(100000);
+    return true;
+}
+
+// Perform a search in the browser area: find search field, inject text.
+// Primary: find AXTextArea via JUCE group tree walking.
+// Fallback: send Cmd+F to focus the field, then read focused element.
+bool performBrowserSearch(AXUIElementRef appRef, NSString* searchText) {
+    AXUIElementRef searchField = NULL;
+
+    // Primary: walk the JUCE browser group's children for AXTextArea
+    NSLog(@"[1/2] Finding search field via browser tree...");
+    AXUIElementRef juceGroup = getJUCEBrowserGroup(appRef);
+    if (juceGroup) {
+        searchField = findSearchField(juceGroup);
+        CFRelease(juceGroup);
+    }
+
+    if (searchField) {
+        NSLog(@"  Search field found via tree: [AXTextArea]");
+    } else {
+        // Fallback: Cmd+F targets process directly, works in background
+        NSLog(@"  Not found via tree, falling back to Cmd+F...");
+        searchField = focusSearchFieldViaCmdF(appRef);
+        if (!searchField) {
+            NSLog(@"ERROR: Could not find search field");
+            return false;
+        }
+        NSLog(@"  Search field found via Cmd+F: [AXTextArea]");
+    }
+
+    bool ok = injectSearchText(appRef, searchField, searchText);
+    CFRelease(searchField);
+    return ok;
 }
 
 // ─── Browser Row Selection ──────────────────────────────────────
@@ -1088,6 +1341,16 @@ int main(int argc, const char* argv[]) {
             NSLog(@"=== SEARCH: \"%@\" ===", searchText);
             performBrowserSearch(appRef, searchText);
         }
+        // ── Mode: Reload XML library ──
+        else if ([mode isEqualToString:@"reload"]) {
+            NSLog(@"=== RELOAD XML LIBRARY ===");
+            reloadXMLLibrary(appRef);
+        }
+        // ── Mode: Export Collection to XML ──
+        else if ([mode isEqualToString:@"exportxml"]) {
+            NSLog(@"=== EXPORT COLLECTION TO XML ===");
+            exportCollectionXML(appRef);
+        }
         else {
             NSLog(@"Usage:");
             NSLog(@"  ./rb_test dump [depth]                — dump AX tree");
@@ -1100,6 +1363,8 @@ int main(int argc, const char* argv[]) {
             NSLog(@"  ./rb_test export VEGA \"track name\"    — search, select, and export track to 'VEGA'");
             NSLog(@"  ./rb_test probe                       — scan browser area by screen coordinates");
             NSLog(@"  ./rb_test browser                     — inspect browser group attributes + children");
+            NSLog(@"  ./rb_test reload                      — reload XML library (press Reload button)");
+            NSLog(@"  ./rb_test exportxml                   — File > Export Collection in xml format");
         }
 
         CFRelease(appRef);
